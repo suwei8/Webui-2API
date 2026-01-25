@@ -1,7 +1,8 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const { sendMessage } = require('./gemini');
+const { sendMessage: sendGeminiMessage } = require('./gemini');
+const { sendChatGPTMessage } = require('./chatgpt');
 
 const app = express();
 const PORT = 3040;
@@ -19,18 +20,35 @@ async function processQueue() {
     }
 
     isProcessing = true;
-    const { req, res, prompt } = requestQueue.shift();
+    const { req, res, prompt, model } = requestQueue.shift();
 
-    console.log(`Processing request (${requestQueue.length} remaining in queue): ${prompt.substring(0, 50)}...`);
+    console.log(`Processing request [${model}] (${requestQueue.length} remaining): ${prompt.substring(0, 50)}...`);
+
+    // Timeout Promise
+    const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Request timed out after 300 seconds")), 300000)
+    );
 
     try {
-        const responseText = await sendMessage(prompt);
+        // Route to correct provider
+        let responsePromise;
+        if (model && (model.includes('gpt') || model.includes('chatgpt'))) {
+            responsePromise = sendChatGPTMessage(prompt);
+        } else {
+            responsePromise = sendGeminiMessage(prompt);
+        }
+
+        // Race between actual processing and timeout
+        const responseText = await Promise.race([
+            responsePromise,
+            timeoutPromise
+        ]);
 
         const completion = {
             id: 'chatcmpl-' + Date.now(),
             object: 'chat.completion',
             created: Math.floor(Date.now() / 1000),
-            model: 'gemini-web',
+            model: model || 'gemini-web',
             choices: [
                 {
                     index: 0,
@@ -52,15 +70,18 @@ async function processQueue() {
     } catch (error) {
         console.error('Error processing request:', error);
         res.status(500).json({ error: error.message });
+
+        // If timeout or crash, maybe restart browser? 
+        // For now, we just ensure queue continues.
     } finally {
         isProcessing = false;
         // Process next request after a small delay to let browser settle
-        setTimeout(() => processQueue(), 1000);
+        setTimeout(() => processQueue(), 2000);
     }
 }
 
 app.get('/', (req, res) => {
-    res.send('Webui-2API Server is running. Use POST /v1/chat/completions to interact.');
+    res.send('Webui-2API Server is running. Use POST /v1/chat/completions to interact (model: "gemini" or "chatgpt").');
 });
 
 app.get('/v1/chat/completions', (req, res) => {
@@ -69,7 +90,7 @@ app.get('/v1/chat/completions', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
     try {
-        const { messages } = req.body;
+        const { messages, model } = req.body;
 
         if (!messages || !Array.isArray(messages) || messages.length === 0) {
             return res.status(400).json({ error: 'Invalid messages array' });
@@ -79,10 +100,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         const lastMessage = messages[messages.length - 1];
         const prompt = lastMessage.content;
 
-        console.log(`Queuing request: ${prompt.substring(0, 50)}... (queue size: ${requestQueue.length})`);
+        console.log(`Queuing request [${model || 'gemini'}]: ${prompt.substring(0, 50)}... (queue size: ${requestQueue.length})`);
 
         // Add to queue
-        requestQueue.push({ req, res, prompt });
+        requestQueue.push({ req, res, prompt, model });
 
         // Try to process
         processQueue();

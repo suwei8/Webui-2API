@@ -6,10 +6,10 @@ const GEMINI_URL = 'https://gemini.google.com/';
 const SELECTORS = {
     // Content editable div for input. 
     INPUT_BOX: 'div.ProseMirror[contenteditable="true"], div[contenteditable="true"], [role="textbox"]',
-    // Send button usually has aria-label "Send" or "Sent"
-    SEND_BUTTON: 'button[aria-label*="Send"], button[aria-label*="发送"], button[data-test-id="send-button"]',
+    // Send button usually has aria-label "Send" or "Sent" or class "send-button"
+    SEND_BUTTON: 'button[aria-label*="Send"], button[aria-label*="发送"], button.send-button, mat-icon-button[aria-label*="发送"]',
     // Stop button indicates generation is in progress
-    STOP_BUTTON: 'button[aria-label*="Stop"], button[aria-label*="停止响应"]',
+    STOP_BUTTON: 'button[aria-label*="Stop"], button[aria-label*="停止响应"], button[aria-label*="停止回答"]',
     // Response containers
     RESPONSE_CONTAINER: 'model-response',
 };
@@ -38,24 +38,47 @@ async function ensurePage() {
 }
 
 async function waitForIdle(page) {
-    console.log('[Status] Checking if Gemini is idle...');
+    console.log('[Status] Checking if Gemini is idle (Wait for Send Button)...');
 
-    // Logic: If STOP_BUTTON exists, it means generation is in progress.
-    // We must WAIT until it disappears.
+    // Robust Idle Check: 
+    // The system is ONLY idle if the SEND button is VISIBLE and ENABLED.
+    // If Stop button exists, it's busy.
+    // If Send button is hidden or disabled, it's busy.
 
     try {
-        // fast check first
+        // 1. Check for Stop Button (Fast Fail)
         const stopBtn = await page.$(SELECTORS.STOP_BUTTON);
         if (stopBtn) {
-            console.log('[Status] Gemini is BUSY (Stop button found). Waiting for idle...');
-            await page.waitForSelector(SELECTORS.STOP_BUTTON, { hidden: true, timeout: 120000 });
-            console.log('[Status] Gemini is now IDLE.');
-        } else {
-            console.log('[Status] Gemini is IDLE (No Stop button).');
+            console.log('[Status] Gemini is BUSY (Stop button found). waiting for it to disappear...');
+            await page.waitForSelector(SELECTORS.STOP_BUTTON, { hidden: true, timeout: 300000 }); // Wait up to 5 mins for generation
         }
+
+        // 2. Wait for Send Button to be Interactive
+        // This is the source of truth.
+        console.log('[Status] Waiting for Send button to be ready...');
+        await page.waitForFunction((selector, inputSelector) => {
+            const btn = document.querySelector(selector);
+            // Check visibility
+            if (!btn) return false;
+            const style = window.getComputedStyle(btn);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+
+            // Check disabled state
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+                // Only consider Idle if Input is Empty
+                const inputVal = document.querySelector(inputSelector)?.innerText?.trim() || '';
+                if (inputVal === '') return true; // Empty + Disabled = Idle
+                return false; // Text + Disabled = Busy/Invalid
+            }
+            return true;
+        }, { timeout: 300000 }, SELECTORS.SEND_BUTTON, SELECTORS.INPUT_BOX);
+
+        console.log('[Status] Gemini is IDLE (Send button ready).');
     } catch (e) {
-        // If timeout or error, we might be stuck or it's actually idle but selector changed.
         console.warn('[Warning] Error waiting for idle:', e.message);
+        // If we timeout waiting for idle, we propagate error to server.js to skip this prompt?
+        // Or we just throw to restart the processQueue item?
+        throw new Error("Gemini stuck in BUSY state (Idle verification failed)");
     }
 }
 
@@ -78,9 +101,11 @@ async function pasteMessage(page, message) {
             // Fallback: if execCommand didn't pop text in (unlikely on modern Chrome), force it
             if (el.innerText.trim() === '') {
                 el.innerText = text;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
             }
+            // Always dispatch events to wake up UI
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a' })); // Dummy keyup to trigger validation
         }
     }, SELECTORS.INPUT_BOX, message);
 
@@ -105,17 +130,44 @@ async function sendMessage(message) {
     console.log('[Input] Sending...');
     await page.keyboard.press('Enter');
 
-    // Double check: if Send button is still there after 1 sec, click it
-    await new Promise(r => setTimeout(r, 1000));
-    const sendBtn = await page.$(SELECTORS.SEND_BUTTON);
-    if (sendBtn) {
-        // Only click if it's not disabled
-        // Note: Using evaluate to check property to avoid potential errors
-        const isDisabled = await page.evaluate(el => el.disabled, sendBtn);
-        if (!isDisabled) {
-            console.log('[Input] clicking Send button fallback...');
-            await sendBtn.click();
+    // Robust Send Verification Loop
+    // Wait up to 5 seconds for input to clear. If not, click button.
+    let inputCleared = false;
+    for (let i = 0; i < 5; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Check if input is empty
+        const inputValue = await page.evaluate((selector) => {
+            const el = document.querySelector(selector);
+            return el ? el.innerText.trim() : '';
+        }, SELECTORS.INPUT_BOX);
+
+        if (inputValue === '') {
+            inputCleared = true;
+            break;
         }
+
+        console.log(`[Input] Text still in box (Attempt ${i + 1}). Retrying Send click...`);
+
+        // Try clicking the button explicitly
+        const sendBtn = await page.$(SELECTORS.SEND_BUTTON);
+        if (sendBtn) {
+            try {
+                // Force click via evaluate to bypass Puppeteer visibility checks if needed
+                await page.evaluate(b => b.click(), sendBtn);
+            } catch (e) {
+                console.warn("Click failed", e);
+            }
+        } else {
+            // If button missing, maybe enter worked? 
+            // But we checked input value and it was present.
+            // Try Enter again
+            await page.keyboard.press('Enter');
+        }
+    }
+
+    if (!inputCleared) {
+        console.warn('[Warning] Failed to clear input box after multiple attempts. Request might fail.');
     }
 
     // 5. Wait for Response Generation to Start and Finish
@@ -125,11 +177,21 @@ async function sendMessage(message) {
     try {
         await Promise.race([
             page.waitForFunction((count, selector) => document.querySelectorAll(selector).length > count, {}, initialResponseCount, SELECTORS.RESPONSE_CONTAINER),
-            page.waitForSelector(SELECTORS.STOP_BUTTON, { timeout: 10000 })
+            page.waitForSelector(SELECTORS.STOP_BUTTON, { timeout: 30000 }) // Increased to 30s
         ]);
     } catch (e) {
         // If we timed out, maybe it was super fast or failed.
-        console.warn('[Warning] Did not detect start of generation immediately.');
+        console.warn('[Warning] Did not detect start of generation immediately (Timeout 30s). Proceeding to wait for idle...');
+    }
+
+    // Now wait for stop button to disappear
+    await waitForIdle(page);
+
+    // Final Check: Wait for Send Button to be present (Double confirmation of idle)
+    try {
+        await page.waitForSelector(SELECTORS.SEND_BUTTON, { timeout: 10000 });
+    } catch (e) {
+        console.warn('[Warning] Send button did not reappear. Page might be stuck.');
     }
 
     // Now wait for idle again (which means generation finished)
