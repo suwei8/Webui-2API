@@ -4,8 +4,8 @@ const path = require('path');
 let browser = null;
 let page = null;
 
-const CHROMIUM_PATH = '/snap/bin/chromium';
-const USER_DATA_DIR = path.join(process.env.HOME, 'snap/chromium/common/chromium');
+const CHROMIUM_PATH = 'flatpak run org.chromium.Chromium';
+const USER_DATA_DIR = path.join(process.env.HOME, '.var/app/org.chromium.Chromium/config/chromium');
 const GEMINI_URL = 'https://gemini.google.com/app';
 
 async function resetConnection() {
