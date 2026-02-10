@@ -76,7 +76,7 @@ curl -X POST http://127.0.0.1:3040/v1/chat/completions \
 ```
 
 ### 注意事项
-
+- **启动浏览器命令**:`env XAUTHORITY=$HOME/.Xauthority /snap/bin/chromium --remote-debugging-port=9222 --no-first-run --disable-gpu https://gemini.google.com/app`
 - **浏览器窗口**: 启动后会弹出一个 Chromium 窗口（或接管现有窗口）。**请勿关闭此窗口**，否则服务将无法工作。
 - **登录状态**: 首次运行时，请确保浏览器已登录相关账号（Google / OpenAI）。如果未登录，请在弹出的窗口中手动登录。
 - **端口安全**: 服务仅监听本地回环地址。如需远程访问，请使用 SSH 隧道或反向代理（Nginx）。
